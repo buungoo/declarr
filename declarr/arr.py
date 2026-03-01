@@ -566,19 +566,54 @@ class ArrSyncEngine:
             )
 
             formats = self.get("/customformat")
+            format_id_map = {d["name"]: d["id"] for d in formats}
+
+            def ensure_formats_exist(names):
+                nonlocal format_id_map
+                if self.cfg["customFormat"] is None:
+                    return
+
+                missing = [n for n in names if n not in format_id_map]
+                if not missing:
+                    return
+
+                for name in missing:
+                    if name not in self.cfg["customFormat"]:
+                        continue
+                    try:
+                        self.post(
+                            "/customformat",
+                            {
+                                "name": name,
+                                **self.cfg["customFormat"][name],
+                            },
+                        )
+                    except Exception as e:
+                        log.error(e)
+
+                format_id_map = {
+                    d["name"]: d["id"] for d in self.get("/customformat")
+                }
+
+            if self.cfg["qualityProfile"] is not None:
+                all_format_names = []
+                for _, v in self.cfg["qualityProfile"].items():
+                    for item in v.get("formatItems", []):
+                        name = item.get("name")
+                        if name:
+                            all_format_names.append(name)
+                ensure_formats_exist(unique(all_format_names))
 
             def gen_formats_items(v):
-                id_score_map = to_dict(v["formatItems"], "name")
+                # Preserve compiled scores; map to existing format IDs.
                 return [
                     {
-                        "name": d["name"],
-                        "format": d["id"],
-                        "score": id_score_map.get(
-                            d["name"],
-                            {"score": 0},
-                        )["score"],
-                    }  #
-                    for d in formats
+                        "name": item["name"],
+                        "format": format_id_map[item["name"]],
+                        "score": item.get("score", 0),
+                    }
+                    for item in v.get("formatItems", [])
+                    if item.get("name") in format_id_map
                 ]
 
             self.sync_resources(
