@@ -195,9 +195,23 @@ class FormatCompiler:
                 format_names = unique(format_names + list(cfg["customFormat"].keys()))
 
             # Compile formats referenced by profiles (and any explicitly provided).
-            compiled["formats"] += FormatStrategy(server_cfg).compile(
+            compiled_formats = FormatStrategy(server_cfg).compile(
                 format_names,
             )["formats"]
+
+            # Fallback: read format YAMLs directly if compile returned nothing.
+            if not compiled_formats and format_names:
+                for name in format_names:
+                    try:
+                        data = yaml.safe_load(
+                            read_file(self.data_dir / "custom_formats" / f"{name}.yml")
+                        )
+                        if data:
+                            compiled_formats.append({"name": name, **data})
+                    except Exception:
+                        pass
+
+            compiled["formats"] += compiled_formats
             # FormatStrategy(server_cfg).import_data(compiled)
 
         # Ensure formats referenced by profiles exist before applying profiles.
