@@ -604,16 +604,47 @@ class ArrSyncEngine:
                             all_format_names.append(name)
                 ensure_formats_exist(unique(all_format_names))
 
-            def gen_formats_items(v):
-                # Preserve compiled scores; map to existing format IDs.
+            def build_score_map(profile_name: str, v: dict) -> dict:
+                score_map = {
+                    item.get("name"): item.get("score", 0)
+                    for item in v.get("formatItems", [])
+                    if item.get("name") is not None
+                }
+                if score_map:
+                    return score_map
+
+                # Fallback: load profile YAML to extract custom format scores.
+                try:
+                    profile_path = (
+                        self.format_compiler.data_dir
+                        / "profiles"
+                        / f"{profile_name}.yml"
+                    )
+                    data = yaml.safe_load(read_file(profile_path)) or {}
+                    formats = list(data.get("custom_formats", []))
+                    if self.type == "radarr":
+                        formats += data.get("custom_formats_radarr", [])
+                    elif self.type == "sonarr":
+                        formats += data.get("custom_formats_sonarr", [])
+
+                    return {
+                        f.get("name"): f.get("score", 0)
+                        for f in formats
+                        if f.get("name") is not None
+                    }
+                except Exception:
+                    return {}
+
+            def gen_formats_items(profile_name: str, v: dict):
+                # Include all known formats to satisfy Radarr, preserve scores.
+                score_map = build_score_map(profile_name, v)
                 return [
                     {
-                        "name": item["name"],
-                        "format": format_id_map[item["name"]],
-                        "score": item.get("score", 0),
+                        "name": name,
+                        "format": fmt_id,
+                        "score": score_map.get(name, 0),
                     }
-                    for item in v.get("formatItems", [])
-                    if item.get("name") in format_id_map
+                    for name, fmt_id in format_id_map.items()
                 ]
 
             self.sync_resources(
@@ -621,7 +652,7 @@ class ArrSyncEngine:
                 self.cfg["qualityProfile"],
                 lambda k, v: {
                     **v,
-                    "formatItems": gen_formats_items(v),
+                    "formatItems": gen_formats_items(k, v),
                 },
                 allow_error=True,
             )
