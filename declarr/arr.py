@@ -164,17 +164,45 @@ class FormatCompiler:
                 cfg["qualityProfile"].keys(),
             )
 
-            # # idk why you'd want to specifically import formats, but you do you
+            def extract_profile_format_names(profile_names):
+                names = []
+                for profile_name in profile_names:
+                    profile_path = self.data_dir / "profiles" / f"{profile_name}.yml"
+                    try:
+                        data = yaml.safe_load(read_file(profile_path)) or {}
+                    except Exception:
+                        continue
+
+                    def collect(list_name):
+                        for item in data.get(list_name, []) or []:
+                            if isinstance(item, str):
+                                names.append(item)
+                            elif isinstance(item, dict):
+                                name = item.get("name")
+                                if name:
+                                    names.append(name)
+
+                    collect("custom_formats")
+                    if cfg["declarr"]["type"] == "radarr":
+                        collect("custom_formats_radarr")
+                    elif cfg["declarr"]["type"] == "sonarr":
+                        collect("custom_formats_sonarr")
+
+                return unique(names)
+
+            format_names = extract_profile_format_names(cfg["qualityProfile"].keys())
+            if cfg["customFormat"] is not None:
+                format_names = unique(format_names + list(cfg["customFormat"].keys()))
+
+            # Compile formats referenced by profiles (and any explicitly provided).
             compiled["formats"] += FormatStrategy(server_cfg).compile(
-                [] if cfg["customFormat"] is None else cfg["customFormat"].keys(),
+                format_names,
             )["formats"]
             # FormatStrategy(server_cfg).import_data(compiled)
 
         # Ensure formats referenced by profiles exist before applying profiles.
         # If customFormat is unset (None), auto-populate it from compiled profiles.
-        if cfg["customFormat"] is None and compiled["formats"]:
-            cfg["customFormat"] = to_dict(compiled["formats"], "name")
-        elif cfg["customFormat"] is not None:
+        if compiled["formats"]:
             cfg["customFormat"] = to_dict(compiled["formats"], "name")
         if cfg["qualityProfile"] is not None:
             cfg["qualityProfile"] = to_dict(
@@ -289,14 +317,16 @@ class ArrSyncEngine:
         defaults: Callable[[str, dict], dict] = lambda k, v: v,
         allow_error=False,
         key: str = "name",
+        delete_missing: bool = True,
     ):
         if cfg is None:
             return
 
         existing = to_dict(self.get(path), key)
-        for name, dat in existing.items():
-            if name not in cfg:
-                self.deferr_delete(f"{path}/{dat['id']}")
+        if delete_missing:
+            for name, dat in existing.items():
+                if name not in cfg:
+                    self.deferr_delete(f"{path}/{dat['id']}")
 
         cfg = map_values(cfg, defaults)
         cfg = map_values(
@@ -563,6 +593,7 @@ class ArrSyncEngine:
                 "/customformat",
                 self.cfg["customFormat"],
                 allow_error=True,
+                delete_missing=False,
             )
 
             formats = self.get("/customformat")
