@@ -309,6 +309,10 @@ class ArrSyncEngine:
             for y in self.cfg[k].values():
                 tags += y.get("tags", [])
 
+        if self.cfg.get("customFormat") is not None:
+            for fmt in self.cfg["customFormat"].values():
+                tags += fmt.get("tags", [])
+
         if self.type == "lidarr":
             tags += sum(
                 [x.get("defaultTags") for x in self.cfg["rootFolder"].values()],
@@ -606,6 +610,24 @@ class ArrSyncEngine:
             self.sync_resources(
                 "/customformat",
                 self.cfg["customFormat"],
+                lambda _, v: {
+                    **{
+                        # Radarr expects "specifications"; some databases use "conditions".
+                        **{k: val for k, val in v.items() if k != "conditions"},
+                        "specifications": (
+                            v.get("specifications")
+                            if v.get("specifications") is not None
+                            else v.get("conditions")
+                        )
+                        or [],
+                    },
+                    # Ensure non-null list fields.
+                    "tests": v.get("tests") or [],
+                    "tags": [
+                        self.tag_map[t.lower()] if isinstance(t, str) else t
+                        for t in (v.get("tags") or [])
+                    ],
+                },
                 allow_error=True,
                 delete_missing=False,
             )
@@ -641,14 +663,6 @@ class ArrSyncEngine:
                 }
 
             if self.cfg["qualityProfile"] is not None:
-                all_format_names = []
-                for _, v in self.cfg["qualityProfile"].items():
-                    for item in v.get("formatItems", []):
-                        name = item.get("name")
-                        if name:
-                            all_format_names.append(name)
-                ensure_formats_exist(unique(all_format_names))
-
             def build_score_map(profile_name: str, v: dict) -> dict:
                 score_map = {
                     item.get("name"): item.get("score", 0)
@@ -672,25 +686,47 @@ class ArrSyncEngine:
                     elif self.type == "sonarr":
                         formats += data.get("custom_formats_sonarr", [])
 
-                    return {
-                        f.get("name"): f.get("score", 0)
-                        for f in formats
-                        if f.get("name") is not None
-                    }
+                    score_map = {}
+                    for f in formats:
+                        if isinstance(f, str):
+                            score_map[f] = 0
+                            continue
+                        name = f.get("name")
+                        if name is not None:
+                            score_map[name] = f.get("score", 0)
+                    return score_map
                 except Exception:
                     return {}
 
+            if self.cfg["qualityProfile"] is not None:
+                all_format_names = []
+                for name, v in self.cfg["qualityProfile"].items():
+                    for item in v.get("formatItems", []):
+                        fmt_name = item.get("name")
+                        if fmt_name:
+                            all_format_names.append(fmt_name)
+                    if not v.get("formatItems"):
+                        all_format_names += list(build_score_map(name, v).keys())
+                ensure_formats_exist(unique(all_format_names))
+
             def gen_formats_items(profile_name: str, v: dict):
-                # Include all known formats to satisfy Radarr, preserve scores.
+                # Use only formats referenced by the profile to avoid invalid min score.
                 score_map = build_score_map(profile_name, v)
-                return [
-                    {
-                        "name": name,
-                        "format": fmt_id,
-                        "score": score_map.get(name, 0),
-                    }
-                    for name, fmt_id in format_id_map.items()
-                ]
+                if not score_map:
+                    return []
+                items = []
+                for name, score in score_map.items():
+                    fmt_id = format_id_map.get(name)
+                    if fmt_id is None:
+                        continue
+                    items.append(
+                        {
+                            "name": name,
+                            "format": fmt_id,
+                            "score": score,
+                        }
+                    )
+                return items
 
             self.sync_resources(
                 "/qualityprofile",
