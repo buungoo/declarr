@@ -662,7 +662,6 @@ class ArrSyncEngine:
                     d["name"]: d["id"] for d in self.get("/customformat")
                 }
 
-            if self.cfg["qualityProfile"] is not None:
             def build_score_map(profile_name: str, v: dict) -> dict:
                 score_map = {
                     item.get("name"): item.get("score", 0)
