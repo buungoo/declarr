@@ -170,11 +170,12 @@ class FormatCompiler:
             )["formats"]
             # FormatStrategy(server_cfg).import_data(compiled)
 
-        if cfg["customFormat"] is not None:
-            cfg["customFormat"] = to_dict(
-                compiled["formats"],
-                "name",
-            )
+        # Ensure formats referenced by profiles exist before applying profiles.
+        # If customFormat is unset (None), auto-populate it from compiled profiles.
+        if cfg["customFormat"] is None and compiled["formats"]:
+            cfg["customFormat"] = to_dict(compiled["formats"], "name")
+        elif cfg["customFormat"] is not None:
+            cfg["customFormat"] = to_dict(compiled["formats"], "name")
         if cfg["qualityProfile"] is not None:
             cfg["qualityProfile"] = to_dict(
                 compiled["profiles"],
