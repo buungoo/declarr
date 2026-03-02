@@ -95,6 +95,9 @@ def main():
         cfg = add_defaults(cfg, {"declarr": {"resolvePaths": []}})
 
         cfg = resolve_paths(cfg, cfg["declarr"].get("resolvePaths", []))
+        # Inherit global declarr settings (e.g. customFormatPreferRaw/Recreate)
+        # without overriding per-service values like type/url.
+        cfg = add_defaults(cfg, {"declarr": cfgs.get("declarr", {})})
 
         cfg["declarr"]["name"] = key
 

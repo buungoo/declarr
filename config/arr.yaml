@@ -8,6 +8,8 @@ declarr:
     - $.*.applications.*.fields.apiKey
     - $.*.indexer.*.fields.password
     - $.*.downloadClient.*.fields.password
+  customFormatRecreate: false
+  customFormatPreferRaw: false
   stateDir: /var/lib/declarr
 prowlarr:
   appProfile:

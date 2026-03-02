@@ -1,6 +1,7 @@
 from typing import Callable
 from pathlib import Path
 from unittest.mock import patch
+from collections import Counter
 import time
 import subprocess
 
@@ -75,6 +76,7 @@ class FormatCompiler:
 
     def compile_formats(self, cfg):
         # use profilarr db as defaults
+        original_profiles = cfg.get("qualityProfile") or {}
         def load_yaml(file_path: str):
             file_type = None
             name = ""
@@ -199,6 +201,26 @@ class FormatCompiler:
                 format_names,
             )["formats"]
 
+            # Optionally prefer raw YAML definitions from the format DB.
+            # This keeps specs exactly as in the repo (e.g., release_title conditions).
+            if format_names and cfg["declarr"].get("customFormatPreferRaw"):
+                raw_map = {}
+                for name in format_names:
+                    try:
+                        data = yaml.safe_load(
+                            read_file(self.data_dir / "custom_formats" / f"{name}.yml")
+                        )
+                        if data:
+                            raw_map[name] = {"name": name, **data}
+                    except Exception:
+                        pass
+                if raw_map:
+                    compiled_map = {f.get("name"): f for f in compiled_formats or []}
+                    merged = {}
+                    merged.update(compiled_map)
+                    merged.update(raw_map)
+                    compiled_formats = [v for _, v in merged.items()]
+
             # Fallback: read format YAMLs directly if compile returned nothing.
             if not compiled_formats and format_names:
                 for name in format_names:
@@ -223,6 +245,13 @@ class FormatCompiler:
                 compiled["profiles"],
                 "name",
             )
+            # Preserve per-profile overrides from the input config (e.g. formatScoreOverrides).
+            for name, overrides in (original_profiles or {}).items():
+                if name in cfg["qualityProfile"] and isinstance(overrides, dict):
+                    if "formatScoreOverrides" in overrides:
+                        cfg["qualityProfile"][name]["formatScoreOverrides"] = overrides[
+                            "formatScoreOverrides"
+                        ]
 
         return cfg
 
@@ -259,6 +288,9 @@ class ArrSyncEngine:
         self.profile_map = {}
 
         self.deferred_deletes = []
+        self._cf_schema_map = None
+        self._cf_schema_by_impl = None
+        self._custom_format_errors = []
 
     def _base_req(self, name, f, path: str, body):
         body = {} if body is None else body
@@ -320,13 +352,207 @@ class ArrSyncEngine:
             )
 
         existing = [v["label"] for v in self.get("/tag")]
-        for tag in [tag.lower() for tag in unique(tags)]:
+        for tag in [t for t in (self._normalise_tag(tag) for tag in unique(tags)) if t]:
             if tag not in existing:
                 self.post("/tag", {"label": tag})
 
             # TODO: delete unused tags
 
-        self.tag_map = {v["label"]: v["id"] for v in self.get("/tag")}
+        self.tag_map = {self._normalise_tag(v["label"]): v["id"] for v in self.get("/tag")}
+
+    @staticmethod
+    def _normalise_tag(tag: str) -> str:
+        tag = tag.lower()
+        tag = "".join(ch if (ch.isalnum() or ch == "-") else "-" for ch in tag)
+        tag = tag.strip("-")
+        while "--" in tag:
+            tag = tag.replace("--", "-")
+        return tag
+
+    def _normalise_custom_format(self, fmt: dict) -> dict:
+        self._load_custom_format_schema()
+        raw_fmt = None
+        if self.cfg.get("declarr", {}).get("customFormatPreferRaw") and fmt.get("name"):
+            try:
+                raw_path = (
+                    self.format_compiler.data_dir
+                    / "custom_formats"
+                    / f"{fmt.get('name')}.yml"
+                )
+                if raw_path.exists():
+                    raw_fmt = yaml.safe_load(read_file(raw_path)) or {}
+            except Exception:
+                raw_fmt = None
+
+        specifications = fmt.get("specifications")
+        if raw_fmt:
+            specifications = raw_fmt.get("specifications") or raw_fmt.get("conditions")
+        if not specifications:
+            specifications = fmt.get("conditions")
+        specifications = specifications or []
+        normalised_specs = []
+        for spec in specifications:
+            if not isinstance(spec, dict):
+                continue
+            implementation = spec.get("implementation")
+            if not implementation:
+                key = spec.get("type") or spec.get("name") or ""
+                implementation = self._cf_schema_map.get(
+                    self._normalise_impl_key(key), ""
+                )
+                if implementation:
+                    spec = {**spec, "implementation": implementation}
+            if implementation and self._cf_schema_by_impl:
+                schema = self._cf_schema_by_impl.get(implementation, {})
+                schema_fields = schema.get("fields", []) or []
+                field_names = {f.get("name") for f in schema_fields}
+                # Fill field values expected by Radarr schema.
+                values = {}
+                for field in field_names:
+                    if field in spec:
+                        values[field] = spec[field]
+                if "value" in field_names and "value" not in values:
+                    if "pattern" in spec:
+                        values["value"] = spec["pattern"]
+                    elif "source" in spec:
+                        values["value"] = spec["source"]
+                    elif "resolution" in spec:
+                        values["value"] = spec["resolution"]
+                if "value" in values:
+                    original_value = values["value"]
+                    # If schema defines select options, map string values to select IDs.
+                    if implementation and self._cf_schema_by_impl:
+                        schema = self._cf_schema_by_impl.get(implementation, {})
+                        schema_fields = schema.get("fields", []) or []
+                        select_field = next(
+                            (f for f in schema_fields if f.get("name") == "value"),
+                            None,
+                        )
+                        select_opts = (
+                            select_field.get("selectOptions")
+                            if select_field
+                            else None
+                        )
+                        if isinstance(values["value"], str) and isinstance(
+                            select_opts, list
+                        ):
+                            opt_map = {}
+                            for opt in select_opts:
+                                if isinstance(opt, dict):
+                                    name = opt.get("name")
+                                    val = opt.get("value")
+                                    if name is not None and val is not None:
+                                        key = "".join(
+                                            ch for ch in str(name).lower() if ch.isalnum()
+                                        )
+                                        opt_map[key] = val
+                            key = "".join(
+                                ch for ch in values["value"].lower() if ch.isalnum()
+                            )
+                            if key in opt_map:
+                                values["value"] = opt_map[key]
+                            elif implementation == "SourceSpecification":
+                                # Heuristic aliases for Sonarr/Radarr source names.
+                                alias_map = {
+                                    "webdl": "web",
+                                    "web": "web",
+                                    "webrip": "webrip",
+                                    "bluray": "bluray",
+                                    "blurayremux": "blurayraw",
+                                    "blurayraw": "blurayraw",
+                                    "dvd": "dvd",
+                                    "hdtv": "television",
+                                    "tv": "television",
+                                    "rawhd": "televisionraw",
+                                    "televisionraw": "televisionraw",
+                                }
+                                alt = alias_map.get(key)
+                                if alt and alt in opt_map:
+                                    values["value"] = opt_map[alt]
+                    if implementation == "ResolutionSpecification":
+                        if isinstance(values["value"], str):
+                            digits = "".join(ch for ch in values["value"] if ch.isdigit())
+                            values["value"] = int(digits) if digits else 0
+                    elif implementation == "SourceSpecification":
+                        if isinstance(values["value"], str):
+                            values["value"] = (
+                                values["value"]
+                                .lower()
+                                .replace("_", "")
+                                .replace("-", "")
+                                .replace(" ", "")
+                            )
+                    elif isinstance(values["value"], str):
+                        values["value"] = values["value"].strip()
+                    # Some Radarr versions still read top-level Value.
+                    spec["value"] = values["value"]
+                spec = {
+                    **spec,
+                    "fields": [{"name": k, "value": v} for k, v in values.items()],
+                }
+                # Avoid confusing schema binding with extra legacy keys.
+                spec.pop("source", None)
+                spec.pop("resolution", None)
+                spec.pop("pattern", None)
+            normalised_specs.append(spec)
+        return {
+            **{k: val for k, val in fmt.items() if k != "conditions"},
+            "specifications": normalised_specs,
+            "tests": fmt.get("tests") or [],
+            "tags": [
+                self.tag_map[self._normalise_tag(t)] if isinstance(t, str) else t
+                for t in (fmt.get("tags") or [])
+            ],
+        }
+
+    def _load_custom_format_schema(self) -> None:
+        if self._cf_schema_map is not None:
+            return
+        self._cf_schema_map = {}
+        self._cf_schema_by_impl = {}
+        self._cf_schema_dump = []
+        try:
+            data = self.get("/customformat/schema")
+        except Exception:
+            return
+        for spec in data or []:
+            implementation = (
+                spec.get("implementation")
+                or spec.get("implementationName")
+                or spec.get("type")
+            )
+            if implementation:
+                self._cf_schema_by_impl[implementation] = spec
+                fields = spec.get("fields") or []
+                self._cf_schema_dump.append(
+                    {
+                        "name": spec.get("name"),
+                        "implementation": implementation,
+                        "fields": [
+                            {
+                                "name": f.get("name"),
+                                "type": f.get("type"),
+                                "valueType": f.get("valueType"),
+                                "selectOptions": f.get("selectOptions")
+                                or f.get("select")
+                                or f.get("items"),
+                            }
+                            for f in fields
+                        ],
+                    }
+                )
+            for key in [
+                spec.get("name"),
+                spec.get("implementation"),
+                spec.get("implementationName"),
+                spec.get("type"),
+            ]:
+                if key and implementation:
+                    self._cf_schema_map[self._normalise_impl_key(key)] = implementation
+
+    @staticmethod
+    def _normalise_impl_key(value: str) -> str:
+        return "".join(ch for ch in value.lower() if ch.isalnum())
 
     def sync_resources(
         self,
@@ -358,14 +584,30 @@ class ArrSyncEngine:
         for name, dat in cfg.items():
             try:
                 if name in existing:
-                    self.put(
-                        f"{path}/{existing[name]['id']}",
-                        {**existing[name], **dat},
-                    )
+                    if (
+                        path == "/customformat"
+                        and self.cfg.get("declarr", {}).get("customFormatRecreate")
+                        and not self._custom_format_equal(existing[name], dat)
+                    ):
+                        self.delete(f"{path}/{existing[name]['id']}")
+                        self.post(path, dat)
+                    else:
+                        self.put(
+                            f"{path}/{existing[name]['id']}",
+                            {**existing[name], **dat},
+                        )
                 else:
                     self.post(path, dat)
 
             except Exception as e:
+                if path == "/customformat":
+                    self._custom_format_errors.append(
+                        {
+                            "name": name,
+                            "error": str(e),
+                            "summary": self._summarise_custom_format(dat),
+                        }
+                    )
                 if not allow_error:
                     raise e
                 log.error(e)
@@ -610,24 +852,7 @@ class ArrSyncEngine:
             self.sync_resources(
                 "/customformat",
                 self.cfg["customFormat"],
-                lambda _, v: {
-                    **{
-                        # Radarr expects "specifications"; some databases use "conditions".
-                        **{k: val for k, val in v.items() if k != "conditions"},
-                        "specifications": (
-                            v.get("specifications")
-                            if v.get("specifications") is not None
-                            else v.get("conditions")
-                        )
-                        or [],
-                    },
-                    # Ensure non-null list fields.
-                    "tests": v.get("tests") or [],
-                    "tags": [
-                        self.tag_map[t.lower()] if isinstance(t, str) else t
-                        for t in (v.get("tags") or [])
-                    ],
-                },
+                lambda _, v: self._normalise_custom_format(v),
                 allow_error=True,
                 delete_missing=False,
             )
@@ -652,7 +877,9 @@ class ArrSyncEngine:
                             "/customformat",
                             {
                                 "name": name,
-                                **self.cfg["customFormat"][name],
+                                **self._normalise_custom_format(
+                                    self.cfg["customFormat"][name]
+                                ),
                             },
                         )
                     except Exception as e:
@@ -669,6 +896,9 @@ class ArrSyncEngine:
                     if item.get("name") is not None
                 }
                 if score_map:
+                    overrides = v.get("formatScoreOverrides", {}) or {}
+                    for name, score in overrides.items():
+                        score_map[name] = score
                     return score_map
 
                 # Fallback: load profile YAML to extract custom format scores.
@@ -693,6 +923,9 @@ class ArrSyncEngine:
                         name = f.get("name")
                         if name is not None:
                             score_map[name] = f.get("score", 0)
+                    overrides = v.get("formatScoreOverrides", {}) or {}
+                    for name, score in overrides.items():
+                        score_map[name] = score
                     return score_map
                 except Exception:
                     return {}
@@ -709,23 +942,16 @@ class ArrSyncEngine:
                 ensure_formats_exist(unique(all_format_names))
 
             def gen_formats_items(profile_name: str, v: dict):
-                # Use only formats referenced by the profile to avoid invalid min score.
+                # Radarr requires all custom formats to be present in profiles.
                 score_map = build_score_map(profile_name, v)
-                if not score_map:
-                    return []
-                items = []
-                for name, score in score_map.items():
-                    fmt_id = format_id_map.get(name)
-                    if fmt_id is None:
-                        continue
-                    items.append(
-                        {
-                            "name": name,
-                            "format": fmt_id,
-                            "score": score,
-                        }
-                    )
-                return items
+                return [
+                    {
+                        "name": name,
+                        "format": fmt_id,
+                        "score": score_map.get(name, 0),
+                    }
+                    for name, fmt_id in format_id_map.items()
+                ]
 
             self.sync_resources(
                 "/qualityprofile",
@@ -809,3 +1035,70 @@ class ArrSyncEngine:
                 self.delete(path, body)
             except Exception:
                 pass
+
+        if self._custom_format_errors:
+            log.error("Custom format errors summary (last run):")
+            for err in self._custom_format_errors:
+                log.error(
+                    f"- {err['name']}: {err['error']} | {err['summary']}"
+                )
+            if getattr(self, "_cf_schema_dump", None):
+                log.error("Custom format schema summary (last run):")
+                for item in self._cf_schema_dump:
+                    field_parts = []
+                    for f in (item.get("fields") or []):
+                        ftype = f.get("type") or f.get("valueType")
+                        opts = f.get("selectOptions")
+                        if isinstance(opts, list) and opts:
+                            opt_preview = ",".join(
+                                str(o.get("value") or o.get("id") or o.get("key") or o)
+                                for o in opts[:12]
+                            )
+                            field_parts.append(f"{f.get('name')}:{ftype}[{opt_preview}]")
+                        else:
+                            field_parts.append(f"{f.get('name')}:{ftype}")
+                    log.error(
+                        f"- {item.get('name')} "
+                        f"({item.get('implementation')}): {', '.join(field_parts)}"
+                    )
+
+    @staticmethod
+    def _summarise_custom_format(fmt: dict) -> str:
+        specs = fmt.get("specifications") or []
+        parts = []
+        for spec in specs:
+            impl = spec.get("implementation") or ""
+            stype = spec.get("type") or ""
+            fields = spec.get("fields") or []
+            field_dump = ",".join(
+                f"{f.get('name')}={f.get('value')}" for f in fields
+            )
+            parts.append(
+                f"{stype or 'unknown'}:{impl or 'unknown'} "
+                f"fields={len(fields)}[{field_dump}]"
+            )
+        return "specs=[" + ", ".join(parts) + "]"
+
+    def _custom_format_equal(self, existing: dict, desired: dict) -> bool:
+        def spec_signature(specs):
+            out = []
+            for spec in specs or []:
+                impl = (
+                    spec.get("implementation")
+                    or spec.get("implementationName")
+                    or spec.get("type")
+                )
+                negate = bool(spec.get("negate", False))
+                required = bool(spec.get("required", False))
+                fields = spec.get("fields") or []
+                field_map = {f.get("name"): f.get("value") for f in fields}
+                if impl in ("SizeSpecification", "YearSpecification"):
+                    value = tuple(sorted(field_map.items()))
+                else:
+                    value = field_map.get("value", spec.get("value"))
+                out.append((impl, negate, required, value))
+            return Counter(out)
+
+        return spec_signature(existing.get("specifications")) == spec_signature(
+            desired.get("specifications")
+        )
