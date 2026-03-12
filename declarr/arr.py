@@ -34,6 +34,12 @@ class FormatCompiler:
     def __init__(self, cfg):
         self.cfg = cfg
 
+        # Support a static path for the format database provided via Nix
+        format_db_path = self.cfg.get("declarr", {}).get("formatDbPath")
+        if format_db_path:
+            self.data_dir = Path(format_db_path)
+            return
+
         state_dir = self.cfg["declarr"]["stateDir"]
         self.data_dir = Path(state_dir) / "format_data"
 

@@ -55,6 +55,12 @@ in {
       type = types.attrs;
       default = {};
     };
+
+    formatDb = mkOption {
+      type = types.nullOr types.package;
+      default = null;
+      description = "Optional package containing the format database.";
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -89,10 +95,23 @@ in {
         Restart = "on-failure";
 
         ExecStart = let
+          # Add formatDb path to config if provided
+          # Also ensure stateDir is set if formatDb is not provided
+          finalConfig =
+            lib.recursiveUpdate
+            {
+              declarr = {
+                stateDir = "/var/lib/declarr";
+              };
+            }
+            (lib.recursiveUpdate cfg.config (lib.optionalAttrs (cfg.formatDb != null) {
+              declarr.formatDbPath = "${cfg.formatDb}";
+            }));
+
           configFile =
             pkgs.writeText
             "config.yaml"
-            (builtins.toJSON cfg.config);
+            (builtins.toJSON finalConfig);
 
           pkg = pkgs.callPackage ./declarr.nix {};
         in
