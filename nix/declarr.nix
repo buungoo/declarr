@@ -4,7 +4,7 @@
 }: let
   profilarr = python3.pkgs.buildPythonPackage rec {
     pname = "profilarr";
-    version = "1.1.3";
+    version = "v1.1.4";
     pyproject = true;
 
     src = fetchFromGitHub {
@@ -47,7 +47,7 @@
         regex
       ]
       ++ (with pkgs; [
-        pkgs.jellyseerr
+        pkgs.seerr
       ]);
 
     pythonImportsCheck = [
@@ -61,7 +61,7 @@
 in
   python3.pkgs.buildPythonApplication {
     pname = "declarr";
-    version = "0.8.0b1";
+    version = "0.1.0";
     pyproject = true;
 
     src = ../.;

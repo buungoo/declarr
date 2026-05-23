@@ -83,18 +83,21 @@ class FormatCompiler:
     def compile_formats(self, cfg):
         # use profilarr db as defaults
         original_profiles = cfg.get("qualityProfile") or {}
-        def load_yaml(file_path: str):
+        def load_yaml(fp: str):
             file_type = None
             name = ""
-            if file_path.startswith("profile/"):
+            if fp.startswith("profile/"):
                 file_type = "profile"
-                name = file_path.removeprefix("profile/")
-            elif file_path.startswith("custom_format/"):
+                # Strip prefix and .yml extension
+                name = fp.removeprefix("profile/")
+            elif fp.startswith("custom_format/"):
                 file_type = "format"
-                name = file_path.removeprefix("custom_format/")
+                # Strip prefix and .yml extension
+                name = fp.removeprefix("custom_format/")
             else:
                 log.error("unexpected path")
                 raise Exception("unexpected path")
+            name = name.removesuffix(".yml")
 
             format_cfg = (
                 cfg.get(
@@ -106,22 +109,21 @@ class FormatCompiler:
                 or {}
             )
 
-            # pp(format_cfg)
-            # pp(self.format_data_source.get_data(name, t))
-
             defaults = "{}"
+            pat = ( 
+                self.data_dir
+                / {
+                    "profile": "profiles",
+                    "format": "custom_formats",
+                }[file_type]
+                / f"{name}.yml"
+            )
+
             try:
-                defaults = read_file(
-                    self.data_dir
-                    / {
-                        "profile": "profiles",
-                        "format": "custom_formats",
-                    }[file_type]
-                    / Path(name)
-                )
+                defaults = read_file(pat)
             except FileNotFoundError:
                 pass
-            defaults = yaml.safe_load(defaults)
+            defaults = yaml.safe_load(defaults) or {}
 
             format_data = deep_merge(format_cfg, defaults)
 
@@ -129,19 +131,16 @@ class FormatCompiler:
 
         def load_regex_patterns():
             patterns = {}
-
             for file in (self.data_dir / "regex_patterns").iterdir():
                 if not file.is_file():
                     continue
 
                 try:
                     data = yaml.safe_load(read_file(file))
-                    patterns[data["name"]] = data["pattern"]
+                    if data and "name" in data and "pattern" in data:
+                        patterns[data["name"]] = data["pattern"]
                 except Exception:
-                    # Silent fail for individual pattern files
                     pass
-
-            # pp(patterns)
             return patterns
 
         with (
@@ -156,8 +155,9 @@ class FormatCompiler:
             patch("profilarr.importer.strategies.profile.load_yaml", new=load_yaml),
             patch("profilarr.importer.strategies.format.load_yaml", new=load_yaml),
             patch("profilarr.importer.utils.load_yaml", new=load_yaml),
+            
             patch(
-                "profilarr.importer.compiler.load_regex_patterns",
+                "profilarr.importer.utils.load_regex_patterns",
                 new=load_regex_patterns,
             ),
         ):
@@ -167,7 +167,7 @@ class FormatCompiler:
                 "api_key": "bafd0de9bc384a17881f27881a5c5e72",
                 "import_as_unique": False,
             }
-
+            
             compiled = ProfileStrategy(server_cfg).compile(
                 cfg["qualityProfile"].keys(),
             )
@@ -240,7 +240,6 @@ class FormatCompiler:
                         pass
 
             compiled["formats"] += compiled_formats
-            # FormatStrategy(server_cfg).import_data(compiled)
 
         # Ensure formats referenced by profiles exist before applying profiles.
         # If customFormat is unset (None), auto-populate it from compiled profiles.
@@ -260,7 +259,7 @@ class FormatCompiler:
                         ]
 
         return cfg
-
+            
 
 class ArrSyncEngine:
     def __init__(self, cfg, format_data_source):
@@ -720,6 +719,8 @@ class ArrSyncEngine:
         if isinstance(obj, list):
             for body in obj:
                 self.post(resource, body)
+            # print(pat)
+            # pp(defaults)
 
             return
 
